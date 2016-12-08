@@ -4,8 +4,8 @@
   "type": "object",
   "properties": {
     "userId": {
-      "id": "string",
-      "type": "integer"
+      "id": "userId",
+      "type": "string"
     },
     "location": {
       "id": "location",

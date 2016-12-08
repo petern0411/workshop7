@@ -20,6 +20,7 @@ var MongoDB = require('mongodb');
 var MongoClient = MongoDB.MongoClient;
 var ObjectID = MongoDB.ObjectID;
 var url = 'mongodb://localhost:27017/facebook';
+var ResetDatabase = require('./resetdatabase');
 
 
 MongoClient.connect(url,function(err, db){
@@ -335,41 +336,48 @@ app.post('/feeditem', validate({ body: StatusUpdateSchema }), function(req, res)
   }
 });
 
-
-function sendDatabaseError(res,err){
-  res.status(500).send("A database error occured: " + err);
+/**
+* Helper function: Sends back HTTP response with error code 500 due to
+* a database error.
+*/
+function sendDatabaseError(res, err) {
+ res.status(500).send("A database error occurred: " + err);
 }
-
 
 // `PUT /feeditem/feedItemId/likelist/userId` content
 app.put('/feeditem/:feeditemid/likelist/:userid', function(req, res) {
   var fromUser = getUserIdFromToken(req.get('Authorization'));
-  // Convert params from string to number.
   var feedItemId = new ObjectID(req.params.feeditemid);
-  var userId = new ObjectID(req.params.userid);
+  var userId = req.params.userid;
   if (fromUser === userId) {
-    db.collections('feedItems').updateOne({_id: feedItemId},
-    {
-      $addToSet:{
-        likeCounter: new ObjectID(userId)
-      }
-    }, function(err){
-      if(err){
-        return sendDatabaseError(res,err);
-      }
-      db.collections('feedItems').findOne({_id: feedItemId}, function(err, feedItem){
-        if(err){
-          return sendDatabaseError(res,err);
+    // First, we can update the like counter.
+    db.collection('feedItems').updateOne({ _id: feedItemId },
+      {
+        // Add `userId` to the likeCounter if it is not already
+        // in the array.
+        $addToSet: {
+          likeCounter: new ObjectID(userId)
         }
-        resolveUserObjects(feedItem.likeCounter, function(err, userMap){
-          if(err){
-            return sendDatabaseError(res,err);
+      }, function(err) {
+        if (err) {
+          return sendDatabaseError(res, err);
+        }
+        // Second, grab the feed item now that we have updated it.
+        db.collection('feedItems').findOne({ _id: feedItemId }, function(err, feedItem) {
+          if (err) {
+            return sendDatabaseError(res, err);
           }
-        res.send(feedItem.likeCounter.map((userId) => userMap[userId]));
-      });
-    }
-  );
-    });  // res.send(feedItem.likeCounter.map((userId) => readDocument('users', userId)));
+          // Return a resolved version of the likeCounter
+          resolveUserObjects(feedItem.likeCounter, function(err, userMap) {
+            if (err) {
+              return sendDatabaseError(res, err);
+            }
+            // Return a resolved version of the likeCounter
+            res.send(feedItem.likeCounter.map((userId) => userMap[userId]));
+          });
+        }
+      );
+    });
   } else {
     // 401: Unauthorized.
     res.status(401).end();
@@ -379,19 +387,35 @@ app.put('/feeditem/:feeditemid/likelist/:userid', function(req, res) {
 // Unlike a feed item.
 app.delete('/feeditem/:feeditemid/likelist/:userid', function(req, res) {
   var fromUser = getUserIdFromToken(req.get('Authorization'));
-  // Convert params from string to number.
-  var feedItemId = parseInt(req.params.feeditemid, 10);
-  var userId = parseInt(req.params.userid, 10);
+  var feedItemId = new ObjectID(req.params.feeditemid);
+  var userId = req.params.userid;
   if (fromUser === userId) {
-    var feedItem = readDocument('feedItems', feedItemId);
-    var likeIndex = feedItem.likeCounter.indexOf(userId);
-    // Remove from likeCounter if present
-    if (likeIndex !== -1) {
-      feedItem.likeCounter.splice(likeIndex, 1);
-      writeDocument('feedItems', feedItem);
-    }
-    // Return a resolved version of the likeCounter
-    res.send(feedItem.likeCounter.map((userId) => readDocument('users', userId)));
+    // Step 1: Remove userId from the likeCounter.
+    db.collection('feedItems').updateOne({ _id: feedItemId },
+      {
+        // Only removes the userId from the likeCounter, if it is in the likeCounter.
+        $pull: {
+          likeCounter: new ObjectID(userId)
+        }
+      }, function(err) {
+      if (err) {
+        return sendDatabaseError(res, err);
+      }
+      // Step 2: Get the feed item.
+      db.collection('feedItems').findOne({ _id: feedItemId }, function(err, feedItem) {
+        if (err) {
+          return sendDatabaseError(res, err);
+        }
+        // Step 3: Resolve the user IDs in the like counter into user objects.
+        resolveUserObjects(feedItem.likeCounter, function(err, userMap) {
+          if (err) {
+            return sendDatabaseError(res, err);
+          }
+          // Return a resolved version of the likeCounter
+          res.send(feedItem.likeCounter.map((userId) => userMap[userId]));
+        });
+      });
+    });
   } else {
     // 401: Unauthorized.
     res.status(401).end();
@@ -400,81 +424,146 @@ app.delete('/feeditem/:feeditemid/likelist/:userid', function(req, res) {
 
 // `PUT /feeditem/feedItemId/content newContent`
 app.put('/feeditem/:feeditemid/content', function(req, res) {
-  var fromUser = getUserIdFromToken(req.get('Authorization'));
-  var feedItemId = req.params.feeditemid;
-  var feedItem = readDocument('feedItems', feedItemId);
-  // Check that the requester is the author of this feed item.
-  if (fromUser === feedItem.contents.author) {
-    // Check that the body is a string, and not something like a JSON object.
-    // We can't use JSON validation here, since the body is simply text!
-    if (typeof(req.body) !== 'string') {
-      // 400: Bad request.
-      res.status(400).end();
-      return;
-    }
-    // Update text content of update.
-    feedItem.contents.contents = req.body;
-    writeDocument('feedItems', feedItem);
-    res.send(getFeedItemSync(feedItemId));
-  } else {
-    // 401: Unauthorized.
-    res.status(401).end();
-  }
-});
+  var fromUser = new ObjectID(getUserIdFromToken(req.get('Authorization')));
+  var feedItemId = new ObjectID(req.params.feeditemid);
 
+  // Only update the feed item if the author matches the currently authenticated
+  // user.
+  db.collection('feedItems').updateOne({
+    _id: feedItemId,
+    // This is how you specify nested fields on the document.
+    "contents.author": fromUser
+  }, { $set: { "contents.contents": req.body } }, function(err, result) {
+    if (err) {
+      return sendDatabaseError(res, err);
+    } else if (result.modifiedCount === 0) {
+      // Could not find the specified feed item. Perhaps it does not exist, or
+      // is not authored by the user.
+      // 400: Bad request.
+      return res.status(400).end();
+    }
+
+    // Update succeeded! Return the resolved feed item.
+    getFeedItem(feedItemId, function(err, feedItem) {
+      if (err) {
+        return sendDatabaseError(res, err);
+      }
+      res.send(feedItem);
+    });
+  });
+});
 // `DELETE /feeditem/:id`
 app.delete('/feeditem/:feeditemid', function(req, res) {
-  var fromUser = getUserIdFromToken(req.get('Authorization'));
-  // Convert from a string into a number.
-  var feedItemId = parseInt(req.params.feeditemid, 10);
-  var feedItem = readDocument('feedItems', feedItemId);
-  // Check that the author of the post is requesting the delete.
-  if (feedItem.contents.author === fromUser) {
-    deleteDocument('feedItems', feedItemId);
-    // Remove references to this feed item from all other feeds.
-    var feeds = getCollection('feeds');
-    var feedIds = Object.keys(feeds);
-    feedIds.forEach((feedId) => {
-      var feed = feeds[feedId];
-      var itemIdx = feed.contents.indexOf(feedItemId);
-      if (itemIdx !== -1) {
-        // Splice out of array.
-        feed.contents.splice(itemIdx, 1);
-        // Update feed.
-        database.writeDocument('feeds', feed);
+  var fromUser = new ObjectID(getUserIdFromToken(req.get('Authorization')));
+  var feedItemId = new ObjectID(req.params.feeditemid);
+
+  // Check if authenticated user has access to delete the feed item.
+  db.collection('feedItems').findOne({
+    _id: feedItemId,
+    "contents.author": fromUser
+  }, function(err, feedItem) {
+    if (err) {
+      return sendDatabaseError(res, err);
+    } else if (feedItem === null) {
+      // Could not find the specified feed item. Perhaps it does not exist, or
+      // is not authored by the user.
+      // 400: Bad request.
+      return res.status(400).end();
+    }
+
+    // User authored the feed item!
+    // Remove feed item from all feeds using $pull and a blank filter.
+    // A blank filter matches every document in the collection.
+    db.collection('feeds').updateMany({}, {
+      $pull: {
+        contents: feedItemId
       }
+    }, function(err) {
+      if (err) {
+        return sendDatabaseError(res, err);
+      }
+
+      // Finally, remove the feed item.
+      db.collection('feedItems').deleteOne({
+        _id: feedItemId
+      }, function(err) {
+        if (err) {
+          return sendDatabaseError(res, err);
+        }
+        // Send a blank response to indicate success.
+        res.send();
+      });
     });
-    // Send a blank response to indicate success.
-    res.send();
-  } else {
-    // 401: Unauthorized.
-    res.status(401).end();
-  }
+  });
 });
 
 //`POST /search queryText`
 app.post('/search', function(req, res) {
-  var fromUser = getUserIdFromToken(req.get('Authorization'));
-  var user = readDocument('users', fromUser);
+  var fromUser = new ObjectID(getUserIdFromToken(req.get('Authorization')));
   if (typeof(req.body) === 'string') {
     // trim() removes whitespace before and after the query.
     // toLowerCase() makes the query lowercase.
     var queryText = req.body.trim().toLowerCase();
-    // Search the user's feed.
-    var feedItemIDs = readDocument('feeds', user.feed).contents;
-    // "filter" is like "map" in that it is a magic method for
-    // arrays. It takes an anonymous function, which it calls
-    // with each item in the array. If that function returns 'true',
-    // it will include the item in a return array. Otherwise, it will
-    // not.
-    // Here, we use filter to return only feedItems that contain the
-    // query text.
-    // Since the array contains feed item IDs, we later map the filtered
-    // IDs to actual feed item objects.
-    res.send(feedItemIDs.filter((feedItemID) => {
-      var feedItem = readDocument('feedItems', feedItemID);
-      return feedItem.contents.contents.toLowerCase().indexOf(queryText) !== -1;
-    }).map(getFeedItemSync));
+    // Get the user.
+    db.collection('users').findOne({ _id: fromUser}, function(err, userData) {
+      if (err) {
+        return sendDatabaseError(res, err);
+      } else if (userData === null) {
+        // User not found.
+        // 400: Bad request.
+        res.status(400).end();
+      }
+
+      // Get the user's feed.
+      db.collection('feeds').findOne({ _id: userData.feed }, function(err, feedData) {
+        if (err) {
+          return sendDatabaseError(res, err);
+        }
+
+        // Look for feed items within the feed that contain queryText.
+        db.collection('feedItems').find({
+          $or: feedData.contents.map((id) => { return { _id: id  }}),
+          $text: {
+            $search: queryText
+          }
+        }).toArray(function(err, items) {
+          if (err) {
+            return sendDatabaseError(res, err);
+          }
+
+          // Resolve all of the feed items.
+          var resolvedItems = [];
+          var errored = false;
+          function onResolve(err, feedItem) {
+            if (errored) {
+              return;
+            } else if (err) {
+              errored = true;
+              sendDatabaseError(res, err);
+            } else {
+              resolvedItems.push(feedItem);
+              if (resolvedItems.length === items.length) {
+                // Send resolved items to the client!
+                res.send(resolvedItems);
+              }
+            }
+          }
+
+          // Resolve all of the matched feed items in parallel.
+          for (var i = 0; i < items.length; i++) {
+            // Would be more efficient if we had a separate helper that
+            // resolved feed items from their objects and not their IDs.
+            // Not a big deal in our small applications, though.
+            getFeedItem(items[i]._id, onResolve);
+          }
+
+          // Special case: No results.
+          if (items.length === 0) {
+            res.send([]);
+          }
+        });
+      });
+    });
   } else {
     // 400: Bad Request.
     res.status(400).end();
@@ -555,9 +644,10 @@ app.delete('/feeditem/:feeditemid/comments/:commentindex/likelist/:userid', func
 // Reset database.
 app.post('/resetdb', function(req, res) {
   console.log("Resetting database...");
+  ResetDatabase (db,function(){
+    res.send();
+  })
   // This is a debug route, so don't do any validation.
-  database.resetDatabase();
-  res.send();
 });
 
 /**
