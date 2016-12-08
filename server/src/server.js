@@ -24,9 +24,6 @@ var url = 'mongodb://localhost:27017/facebook';
 
 MongoClient.connect(url,function(err, db){
 
-
-
-
 app.use(bodyParser.text());
 app.use(bodyParser.json());
 app.use(express.static('../client/build'));
@@ -169,14 +166,15 @@ function getUserIdFromToken(authorizationLine) {
     // Convert the UTF-8 string into a JavaScript object.
     var tokenObj = JSON.parse(regularString);
     var id = tokenObj['id'];
-    // Check that id is a number.
+    // Check that id is a string.
     if (typeof id === 'string') {
       return id;
     } else {
-      // Not a number. Return -1, an invalid ID.
+      // Not a number. Return "", an invalid ID.
       return "";
     }
-  } catch (e) {
+  }
+  catch (e) {
     // Return an invalid ID.
     return -1;
   }
@@ -185,12 +183,9 @@ function getUserIdFromToken(authorizationLine) {
 
 /**
  * Adds a new status update to the database.
+ * @param user ObjectID of the user.
  */
-function postStatusUpdate(user, location, contents, image) {
-  // If we were implementing this for real on an actual server, we would check
-  // that the user ID is correct & matches the authenticated user. But since
-  // we're mocking it, we can be less strict.
-
+function postStatusUpdate(user, location, contents, image, callback) {
   // Get the current UNIX time.
   var time = new Date().getTime();
   // The new status update. The database will assign the ID for us.
@@ -202,61 +197,84 @@ function postStatusUpdate(user, location, contents, image) {
       "postDate": time,
       "location": location,
       "contents": contents,
-      "image": image,
-      "likeCounter": []
+      "image": image
     },
     // List of comments on the post
     "comments": []
   };
 
   // Add the status update to the database.
-  // Returns the status update w/ an ID assigned.
-  newStatusUpdate = addDocument('feedItems', newStatusUpdate);
+  db.collection('feedItems').insertOne(newStatusUpdate, function(err, result) {
+    if (err) {
+      return callback(err);
+    }
+    // Unlike the mock database, MongoDB does not return the newly added object
+    // with the _id set.
+    // Attach the new feed item's ID to the newStatusUpdate object. We will
+    // return this object to the client when we are done.
+    // (When performing an insert operation, result.insertedId contains the new
+    // document's ID.)
+    newStatusUpdate._id = result.insertedId;
 
-  // Add the status update reference to the front of the current user's feed.
-  var userData = readDocument('users', user);
-  var feedData = readDocument('feeds', userData.feed);
-  feedData.contents.unshift(newStatusUpdate._id);
-
-  // Update the feed object.
-  writeDocument('feeds', feedData);
-
-  // Return the newly-posted object.
-  return newStatusUpdate;
+    // Retrieve the author's user object.
+    db.collection('users').findOne({ _id: user }, function(err, userObject) {
+      if (err) {
+        return callback(err);
+      }
+      // Update the author's feed with the new status update's ID.
+      db.collection('feeds').updateOne({ _id: userObject.feed },
+        {
+          $push: {
+            contents: {
+              $each: [newStatusUpdate._id],
+              $position: 0
+            }
+          }
+        },
+        function(err) {
+          if (err) {
+            return callback(err);
+          }
+          // Return the new status update to the application.
+          callback(null, newStatusUpdate);
+        }
+      );
+    });
+  });
 }
 
 //functions that were added
 
 /**
-* Resolves a list of user objects. Returns an object that maps user IDs to
-* user objects.
-*/
+ * Resolves a list of user objects. Returns an object that maps user IDs to
+ * user objects.
+ */
 function resolveUserObjects(userList, callback) {
- // Special case: userList is empty.
- // It would be invalid to query the database with a logical OR
- // query with an empty array.
- if (userList.length === 0) {
-   callback(null, {});
- } else {
-   // Build up a MongoDB "OR" query to resolve all of the user objects
-   // in the userList.
-   var query = {
-     $or: userList.map((id) => { return {_id: id } })
-   };
-   // Resolve 'like' counter
-   db.collection('users').find(query).toArray(function(err, users) {
-     if (err) {
-       return callback(err);
-     }
-     // Build a map from ID to user object.
-     // (so userMap["4"] will give the user with ID 4)
-     var userMap = {};
-     users.forEach((user) => {
-       userMap[user._id] = user;
-     });
-     callback(null, userMap);
-   });
- }
+  // Special case: userList is empty.
+  // It would be invalid to query the database with a logical OR
+  // query with an empty array.
+  if (userList.length === 0) {
+    callback(null, {});
+  } else {
+    // Build up a MongoDB "OR" query to resolve all of the user objects
+    // in the userList.
+    var query = {
+      $or: userList.map((id) => { return {_id: id } })
+    };
+    // Resolve 'like' counter
+    db.collection('users').find(query).toArray(function(err, users) {
+      if (err) {
+        return callback(err);
+      }
+      // Build a map from ID to user object.
+      // (so userMap["4"] will give the user with ID 4)
+      var userMap = {};
+      users.forEach((user) => {
+        userMap[user._id] = user;
+      });
+      callback(null, userMap);
+    });
+  }
 }
 
 
@@ -264,26 +282,29 @@ function resolveUserObjects(userList, callback) {
 /**
  * Get the feed data for a particular user.
  */
-app.get('/user/:userid/feed', function(req, res) {
-  var userid = req.params.userid;
-  var fromUser = getUserIdFromToken(req.get('Authorization'));
-  // userid is a string. We need it to be a number.
-  if (fromUser === userid) {
-    getFeedData(new ObjectID(userid), function(err,feedData){
-      if(err){
-      res.status(500).send("Database error: " + err);
-    } else if(feedData === null){
-      res.status(400).send("Could not look up feed for user " + userid);
-    } else {
-      res.send(feedData);
-    }
-  });
-    // Send response.
-  } else {
-    // 403: Unauthorized request.
-    res.status(403).end();
-  }
-});
+ app.get('/user/:userid/feed', function(req, res) {
+   var userid = req.params.userid;
+   var fromUser = getUserIdFromToken(req.get('Authorization'));
+   if (fromUser === userid) {
+     // Convert userid into an ObjectID before passing it to database queries.
+     getFeedData(new ObjectID(userid), function(err, feedData) {
+       if (err) {
+         // A database error happened.
+         // Internal Error: 500.
+         res.status(500).send("Database error: " + err);
+       } else if (feedData === null) {
+         // Couldn't find the feed in the database.
+         res.status(400).send("Could not look up feed for user " + userid);
+       } else {
+         // Send data.
+         res.send(feedData);
+       }
+     });
+   } else {
+     // 403: Unauthorized request.
+     res.status(403).end();
+   }
+ });
 
 //`POST /feeditem { userId: user, location: location, contents: contents  }`
 app.post('/feeditem', validate({ body: StatusUpdateSchema }), function(req, res) {
@@ -294,34 +315,61 @@ app.post('/feeditem', validate({ body: StatusUpdateSchema }), function(req, res)
   // Check if requester is authorized to post this status update.
   // (The requester must be the author of the update.)
   if (fromUser === body.userId) {
-    var newUpdate = postStatusUpdate(body.userId, body.location, body.contents, body.image);
-    // When POST creates a new resource, we should tell the client about it
-    // in the 'Location' header and use status code 201.
-    res.status(201);
-    res.set('Location', '/feeditem/' + newUpdate._id);
-     // Send the update!
-    res.send(newUpdate);
+    postStatusUpdate(new ObjectID(fromUser), body.location, body.contents, body.image, function(err, newUpdate) {
+      if (err) {
+        // A database error happened.
+        // 500: Internal error.
+        res.status(500).send("A database error occurred: " + err);
+      } else {
+        // When POST creates a new resource, we should tell the client about it
+        // in the 'Location' header and use status code 201.
+        res.status(201);
+        res.set('Location', '/feeditem/' + newUpdate._id);
+          // Send the update!
+        res.send(newUpdate);
+      }
+    });
   } else {
     // 401: Unauthorized.
     res.status(401).end();
   }
 });
 
+
+function sendDatabaseError(res,err){
+  res.status(500).send("A database error occured: " + err);
+}
+
+
 // `PUT /feeditem/feedItemId/likelist/userId` content
 app.put('/feeditem/:feeditemid/likelist/:userid', function(req, res) {
   var fromUser = getUserIdFromToken(req.get('Authorization'));
   // Convert params from string to number.
-  var feedItemId = parseInt(req.params.feeditemid, 10);
-  var userId = parseInt(req.params.userid, 10);
+  var feedItemId = new ObjectID(req.params.feeditemid);
+  var userId = new ObjectID(req.params.userid);
   if (fromUser === userId) {
-    var feedItem = readDocument('feedItems', feedItemId);
-    // Add to likeCounter if not already present.
-    if (feedItem.likeCounter.indexOf(userId) === -1) {
-      feedItem.likeCounter.push(userId);
-      writeDocument('feedItems', feedItem);
+    db.collections('feedItems').updateOne({_id: feedItemId},
+    {
+      $addToSet:{
+        likeCounter: new ObjectID(userId)
+      }
+    }, function(err){
+      if(err){
+        return sendDatabaseError(res,err);
+      }
+      db.collections('feedItems').findOne({_id: feedItemId}, function(err, feedItem){
+        if(err){
+          return sendDatabaseError(res,err);
+        }
+        resolveUserObjects(feedItem.likeCounter, function(err, userMap){
+          if(err){
+            return sendDatabaseError(res,err);
+          }
+        res.send(feedItem.likeCounter.map((userId) => userMap[userId]));
+      });
     }
-    // Return a resolved version of the likeCounter
-    res.send(feedItem.likeCounter.map((userId) => readDocument('users', userId)));
+  );
+    });  // res.send(feedItem.likeCounter.map((userId) => readDocument('users', userId)));
   } else {
     // 401: Unauthorized.
     res.status(401).end();
